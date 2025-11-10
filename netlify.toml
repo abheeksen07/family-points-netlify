@@ -1,0 +1,10 @@
+[build]
+  publish = "."                 # serve the repo root (where index.html lives)
+  functions = "netlify/functions"
+  command = ""                  # no build step for a plain HTML app
+
+[[redirects]]
+  from = "/api/sheets"
+  to = "/.netlify/functions/sheets"
+  status = 200
+
