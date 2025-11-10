@@ -1,6 +1,6 @@
 // Serverless proxy to your Apps Script exec URL (fixes CORS)
 export async function handler(event) {
-  const EXEC_URL = "https://script.google.com/macros/s/AKfycbwEAAhKZnqlIvuHa-p2Wh8FNAeC5z_fbafYNQ7ijrpxIFZuJ1y57rl64eBU5HUj3LsE5g/exec";
+  const EXEC_URL = "https://script.google.com/macros/s/AKfycbxWbj76ljjgXQ-0INbjh2zywu0frK5IUTg6EpiogpGfXw6Upxagr7SiSHRE3cn2QB8ZfA/exec
 
   try {
     const method = event.httpMethod.toUpperCase();
