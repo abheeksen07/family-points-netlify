@@ -1,0 +1,94 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>FamilyPoints Sheets API Tester</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#0b1220; color:#e5e7eb; padding:20px;}
+.card{background:#111827; border:1px solid #1f2937; border-radius:12px; padding:16px; max-width:900px; margin:0 auto;}
+input,textarea,button{font-size:14px;}
+input,textarea{background:#0b1220; color:#e5e7eb; border:1px solid #374151; border-radius:8px; padding:8px;}
+button{background:#2563eb; color:#fff; border:none; border-radius:8px; padding:8px 12px; cursor:pointer;}
+button.secondary{background:#374151;}
+pre{white-space:pre-wrap; background:#0b1220; border:1px solid #374151; padding:10px; border-radius:8px; max-height:360px; overflow:auto;}
+.row{display:flex; gap:10px; margin-bottom:10px; flex-wrap:wrap;}
+label{ display:flex; flex-direction:column; gap:6px; min-width:220px; flex:1; }
+.small{font-size:12px; color:#9ca3af;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Google Sheets Web App Tester</h2>
+    <p class="small">Use this to verify your Apps Script backend independently of your app.</p>
+    <div class="row">
+      <label>Exec URL
+        <input id="url" value="https://script.google.com/macros/s/AKfycbwEAAhKZnqlIvuHa-p2Wh8FNAeC5z_fbafYNQ7ijrpxIFZuJ1y57rl64eBU5HUj3LsE5g/exec"/>
+      </label>
+      <label>Code
+        <input id="code" value="sen-family"/>
+      </label>
+    </div>
+    <div class="row">
+      <button id="btn-get">GET (read)</button>
+      <button id="btn-post">POST (write)</button>
+      <button id="btn-append" class="secondary">appendTest</button>
+    </div>
+    <div class="row">
+      <label>POST Body (JSON)
+        <textarea id="body" rows="6">{{"code":"sen-family","data":{{"tester":true,"t":1762728468}}}}</textarea>
+      </label>
+    </div>
+    <div class="row">
+      <label>Result
+        <pre id="out">Ready.</pre>
+      </label>
+    </div>
+  </div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+const log = (x)=>{document.getElementById('out').textContent = typeof x==='string'? x : JSON.stringify(x,null,2);};
+
+document.getElementById('btn-get').onclick = async ()=>{
+  const u = document.getElementById('url').value.trim();
+  const code = document.getElementById('code').value.trim();
+  const url = u + '?code=' + encodeURIComponent(code);
+  log('GET ' + url + '\n…');
+  try{
+    const res = await fetch(url, { method:'GET' });
+    const j = await res.json();
+    log(j);
+  }catch(e){
+    log('GET error: ' + (e && e.message ? e.message : e));
+  }
+};
+
+document.getElementById('btn-post').onclick = async ()=>{
+  const u = document.getElementById('url').value.trim();
+  let body;
+  try { body = JSON.parse(document.getElementById('body').value); } catch(e){ return log('Invalid JSON in body: ' + e.message); }
+  log('POST ' + u + '\n…');
+  try{
+    const res = await fetch(u, { method:'POST', headers:{'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)});
+    const j = await res.json();
+    log(j);
+  }catch(e){
+    log('POST error: ' + (e && e.message ? e.message : e));
+  }
+};
+
+document.getElementById('btn-append').onclick = async ()=>{
+  const u = document.getElementById('url').value.trim() + '?action=appendTest';
+  log('GET ' + u + '\n…');
+  try{
+    const res = await fetch(u, { method:'GET' });
+    const j = await res.json();
+    log(j);
+  }catch(e){
+    log('appendTest error: ' + (e && e.message ? e.message : e));
+  }
+};
+</script>
+</body>
+</html>
