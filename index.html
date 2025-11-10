@@ -8,636 +8,685 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React 18 + ReactDOM (CDN) -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<!-- Babel to run JSX in the browser (simple for small apps) -->
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel to run JSX in the browser -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
 <body class="bg-slate-50">
   <div id="root"></div>
 
-  <!-- Your app code -->
   <script type="text/babel" data-presets="react">
   const { useEffect, useMemo, useState } = React;
 
-// ------------------------------------------------------
-// Family Points – Routines, Demerits & Rewards (No Wheel)
-// - Browser-only (localStorage). No backend.
-// - Kids submit Routine check-ins → Parent approves → points credited.
-// - Parents can apply Demerits (catalogued negative points) or bonuses.
-// - Rewards store; redemption subtracts points. Redemption is Parent-Mode only.
-// - Parent Mode (PIN) guards approvals, management, and redemption actions.
-// ------------------------------------------------------
+  // ------------------------------------------------------
+  // Family Points – Sheets sync via Netlify Function proxy
+  // ------------------------------------------------------
+  const STORAGE_KEY = "family-points-state-v4"; // bump to avoid stale local data
+  const DEFAULT_PARENT_PIN = "1234";
+  const ENDPOINT = "/api/sheets";     // <-- Netlify proxy route
+  const FAMILY_CODE = "sen-family";   // shared doc key
+  const TOKEN = "";                   // optional ?token= if you add auth in Apps Script
 
-const STORAGE_KEY = "family-points-state-v3";
-const DEFAULT_PARENT_PIN = "1234";
-const ENDPOINT = "/api/sheets";
+  // --- Remote sync helpers ---
+  async function loadRemoteState() {
+    const url = new URL(ENDPOINT, location.origin);
+    url.searchParams.set("code", FAMILY_CODE);
+    if (TOKEN) url.searchParams.set("token", TOKEN);
+    const res = await fetch(url.toString(), { method: "GET" });
+    const txt = await res.text();
+    let j; try { j = JSON.parse(txt); } catch { throw new Error("Bad JSON from API: " + txt.slice(0,120)); }
+    if (!j.ok) throw new Error(j.error || "Load failed");
+    return j.data || null;
+  }
 
-function FamilyPointsApp() {
-  // --- Core entities ---
-  const [kids, setKids] = useState([
-    { id: "k1", name: "Aarno", points: 0 },
-    { id: "k2", name: "Shayoni", points: 0 },
-  ]);
-
-  // Routines: {id, name, points, freq: 'Daily'|'Weekly'|'Ad-hoc'} (positive)
-  const [routines, setRoutines] = useState([
-    { id: "rt1", name: "Make bed before school", points: 1, freq: "Daily" },
-    { id: "rt2", name: "Clean room before bed", points: 2, freq: "Daily" },
-    { id: "rt3", name: "Fold laundry", points: 4, freq: "Weekly" },
-  ]);
-
-  // Demerits: {id, name, points} (negative values)
-  const [demerits, setDemerits] = useState([
-    { id: "dm1", name: "Argued / rude", points: -1 },
-    { id: "dm2", name: "Did not clean room", points: -2 },
-  ]);
-
-  // Rewards: {id, name, cost}
-  const [rewards, setRewards] = useState([
-    { id: "rw1", name: "Ice cream outing", cost: 20 },
-    { id: "rw2", name: "Pokémon cards", cost: 25 },
-    { id: "rw3", name: "Screen time (30 mins)", cost: 10 },
-  ]);
-
-  // Transactions: {id, ts, kidId, delta, reason, parent}
-  const [txns, setTxns] = useState([]);
-
-  // Submissions: kid check-ins awaiting approval
-  // {id, ts, kidId, routineId, status: 'pending'|'approved'|'rejected', note}
-  const [subs, setSubs] = useState([]);
-
-  // Modes & UI
-  const [isParentMode, setIsParentMode] = useState(false);
-  const [parentPIN, setParentPIN] = useState(DEFAULT_PARENT_PIN);
-  const [activeTab, setActiveTab] = useState("dashboard");
-  const [activeKidId, setActiveKidId] = useState("k1");
-  const [filterKid, setFilterKid] = useState("all");
-
-  // Load / Save
-  useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        parsed.kids && setKids(parsed.kids);
-        parsed.routines && setRoutines(parsed.routines);
-        parsed.demerits && setDemerits(parsed.demerits);
-        parsed.rewards && setRewards(parsed.rewards);
-        parsed.txns && setTxns(parsed.txns);
-        parsed.subs && setSubs(parsed.subs);
-        parsed.parentPIN && setParentPIN(parsed.parentPIN);
-      } catch (e) {
-        console.warn("Failed to parse saved state", e);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ kids, routines, demerits, rewards, txns, subs, parentPIN })
-    );
-  }, [kids, routines, demerits, rewards, txns, subs, parentPIN]);
-
-  const kidMap = useMemo(() => Object.fromEntries(kids.map(k => [k.id, k])), [kids]);
-  const routineMap = useMemo(() => Object.fromEntries(routines.map(r => [r.id, r])), [routines]);
-  const demeritMap = useMemo(() => Object.fromEntries(demerits.map(d => [d.id, d])), [demerits]);
-
-  // Helpers
-  const addTxn = (kidId, delta, reason, parent = "Parent") => {
-    const t = { id: rid(), ts: new Date().toISOString(), kidId, delta, reason, parent };
-    setTxns(prev => [t, ...prev]);
-    setKids(prev => prev.map(k => (k.id === kidId ? { ...k, points: Math.max(0, k.points + delta) } : k)));
-  };
-
-  const submitRoutine = (kidId, routineId, note = "") => {
-    const routine = routineMap[routineId];
-    if (!routine) return;
-    const todayKey = new Date().toDateString();
-    const dup = subs.find(s => s.kidId === kidId && s.routineId === routineId && new Date(s.ts).toDateString() === todayKey && s.status !== 'rejected');
-    if (dup) { alert("Already submitted for today."); return; }
-    const s = { id: rid(), ts: new Date().toISOString(), kidId, routineId, status: "pending", note };
-    setSubs(prev => [s, ...prev]);
-  };
-
-  const approveSubmission = (subId) => {
-    const existing = subs.find(x => x.id === subId);
-    if (!existing) return;
-    const r = routineMap[existing.routineId];
-    if (!r) return;
-    setSubs(prev => prev.map(s => (s.id === subId ? { ...s, status: "approved" } : s)));
-    addTxn(existing.kidId, r.points, `Approved: ${r.name}`);
-  };
-
-  const rejectSubmission = (subId) => {
-    setSubs(prev => prev.map(s => (s.id === subId ? { ...s, status: "rejected" } : s)));
-  };
-
-  const applyDemerit = (kidId, demeritId) => {
-    const d = demeritMap[demeritId];
-    if (!d) return;
-    addTxn(kidId, d.points, `Demerit: ${d.name}`);
-  };
-
-  const resetWeek = () => {
-    if (!window.confirm("Start a new week? This keeps history but sets balances to 0.")) return;
-    setKids(prev => prev.map(k => ({ ...k, points: 0 })));
-    setTxns(prev => [{ id: rid(), ts: new Date().toISOString(), kidId: null, delta: 0, reason: "Weekly reset", parent: "System" }, ...prev]);
-  };
-
-  const startOfWeek = () => {
-    const d = new Date();
-    const day = d.getDay(); // 0 Sun
-    const diff = d.getDate() - day; // Sunday start
-    const s = new Date(d.setDate(diff));
-    s.setHours(0,0,0,0);
-    return s;
-  };
-
-  const weeklyKidCounts = useMemo(() => {
-    const start = startOfWeek();
-    const counts = Object.fromEntries(kids.map(k => [k.id, 0]));
-    txns.forEach(t => {
-      if (!t.kidId || t.delta <= 0) return;
-      const d = new Date(t.ts);
-      if (d >= start) counts[t.kidId] = (counts[t.kidId] || 0) + t.delta;
+  async function saveRemoteState(state) {
+    const url = TOKEN ? `${ENDPOINT}?token=${encodeURIComponent(TOKEN)}` : ENDPOINT;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // avoids preflight
+      body: JSON.stringify({ code: FAMILY_CODE, data: state })
     });
-    return counts;
-  }, [txns, kids]);
+    const txt = await res.text();
+    let j; try { j = JSON.parse(txt); } catch { throw new Error("Bad JSON from API: " + txt.slice(0,120)); }
+    if (!j.ok) throw new Error(j.error || "Save failed");
+    return j;
+  }
 
-  const pendingSubs = subs.filter(s => s.status === 'pending');
+  function FamilyPointsApp() {
+    // --- Core entities ---
+    const [kids, setKids] = useState([
+      { id: "k1", name: "Aarno", points: 0 },
+      { id: "k2", name: "Shayoni", points: 0 },
+    ]);
 
-  // UI
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="sticky top-0 z-30 backdrop-blur bg-white/70 border-b border-slate-200">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="text-2xl">🏆</span>
-            <h1 className="text-xl font-semibold">Family Points</h1>
-          </div>
-          <div className="flex items-center gap-2">
-            {isParentMode && (
-              <span className="text-xs px-2 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200">{pendingSubs.length} pending</span>
-            )}
-            <button
-              className={`px-3 py-1.5 rounded-xl text-sm border ${isParentMode ? "bg-emerald-600 text-white" : "bg-white"}`}
-              onClick={() => toggleParent({ isParentMode, setIsParentMode, parentPIN })}
-            >{isParentMode ? "Parent Mode" : "Kid View"}</button>
-          </div>
-        </div>
-      </header>
+    const [routines, setRoutines] = useState([
+      { id: "rt1", name: "Make bed before school", points: 1, freq: "Daily" },
+      { id: "rt2", name: "Clean room before bed", points: 2, freq: "Daily" },
+      { id: "rt3", name: "Fold laundry", points: 4, freq: "Weekly" },
+    ]);
 
-      <main className="max-w-6xl mx-auto px-4 py-6">
-        <nav className="flex gap-2 mb-6">
-          {[
-            { id: "dashboard", label: "Dashboard" },
-            { id: "routines", label: "Routines" },
-            { id: "transactions", label: "History" },
-            { id: "manage", label: "Manage" },
-            { id: "settings", label: "Settings" },
-          ].map(t => (
-            <button key={t.id} onClick={() => setActiveTab(t.id)} className={`px-3 py-1.5 rounded-xl text-sm border ${activeTab === t.id ? "bg-slate-900 text-white" : "bg-white"}`}>{t.label}</button>
-          ))}
-        </nav>
+    const [demerits, setDemerits] = useState([
+      { id: "dm1", name: "Argued / rude", points: -1 },
+      { id: "dm2", name: "Did not clean room", points: -2 },
+    ]);
 
-        {activeTab === "dashboard" && (
-          <section className="grid md:grid-cols-3 gap-4">
-            {kids.map(k => (
-              <KidCard
-                key={k.id}
-                kid={k}
-                rewards={rewards}
-                onRedeem={(reward) => handleRedeem({ kid: k, reward, addTxn, isParentMode })}
-                isParentMode={isParentMode}
-                setPoints={(id, pts) => setKids(prev => prev.map(x => x.id===id?{...x, points: Math.max(0, pts)}:x))}
-                weeklyPoints={weeklyKidCounts[k.id] || 0}
-              />
-            ))}
-            <Leaderboard kids={kids} />
-          </section>
-        )}
+    const [rewards, setRewards] = useState([
+      { id: "rw1", name: "Ice cream outing", cost: 20 },
+      { id: "rw2", name: "Pokémon cards", cost: 25 },
+      { id: "rw3", name: "Screen time (30 mins)", cost: 10 },
+    ]);
 
-        {activeTab === "routines" && (
-          <section className="grid md:grid-cols-3 gap-6 items-start">
-            <div className="md:col-span-2 bg-white border rounded-2xl shadow-sm p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-sm">I am</span>
-                <KidPicker kids={kids} value={activeKidId} onChange={setActiveKidId} />
-              </div>
-              <RoutineList routines={routines} onSubmit={(routineId) => submitRoutine(activeKidId, routineId)} />
+    // Transactions & submissions
+    const [txns, setTxns] = useState([]); // {id, ts, kidId, delta, reason, parent}
+    const [subs, setSubs] = useState([]); // {id, ts, kidId, routineId, status, note}
+
+    // Modes / UI
+    const [isParentMode, setIsParentMode] = useState(false);
+    const [parentPIN, setParentPIN] = useState(DEFAULT_PARENT_PIN);
+    const [activeTab, setActiveTab] = useState("dashboard");
+    const [activeKidId, setActiveKidId] = useState("k1");
+    const [filterKid, setFilterKid] = useState("all");
+
+    // Sync status + first-load guard
+    const [syncStatus, setSyncStatus] = useState("idle");
+    const [booted, setBooted] = useState(false);
+
+    // Maps
+    const kidMap = useMemo(() => Object.fromEntries(kids.map(k => [k.id, k])), [kids]);
+    const routineMap = useMemo(() => Object.fromEntries(routines.map(r => [r.id, r])), [routines]);
+    const demeritMap = useMemo(() => Object.fromEntries(demerits.map(d => [d.id, d])), [demerits]);
+
+    // Initial load: local (fast) then remote (authoritative)
+    useEffect(() => {
+      // 1) seed from local cache
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          parsed.kids && setKids(parsed.kids);
+          parsed.routines && setRoutines(parsed.routines);
+          parsed.demerits && setDemerits(parsed.demerits);
+          parsed.rewards && setRewards(parsed.rewards);
+          parsed.txns && setTxns(parsed.txns);
+          parsed.subs && setSubs(parsed.subs);
+          parsed.parentPIN && setParentPIN(parsed.parentPIN);
+        } catch (e) { console.warn("Failed to parse cache", e); }
+      }
+
+      // 2) fetch from remote
+      let cancelled = false;
+      setSyncStatus("loading…");
+      loadRemoteState()
+        .then(remote => {
+          if (cancelled) return;
+          if (remote) {
+            remote.kids && setKids(remote.kids);
+            remote.routines && setRoutines(remote.routines);
+            remote.demerits && setDemerits(remote.demerits);
+            remote.rewards && setRewards(remote.rewards);
+            remote.txns && setTxns(remote.txns);
+            remote.subs && setSubs(remote.subs);
+            remote.parentPIN && setParentPIN(remote.parentPIN);
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+          }
+          setSyncStatus("loaded @ " + new Date().toLocaleTimeString());
+          setBooted(true);
+        })
+        .catch(err => {
+          console.warn("Remote load failed:", err?.message || err);
+          setSyncStatus("load failed: " + (err?.message || err));
+          setBooted(true); // allow local-only operation if backend down
+        });
+
+      return () => { cancelled = true; };
+    }, []);
+
+    // Save: always update local cache; push remote after first load (debounced)
+    useEffect(() => {
+      const state = { kids, routines, demerits, rewards, txns, subs, parentPIN };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      if (!booted) return;
+
+      const t = setTimeout(() => {
+        setSyncStatus("saving…");
+        saveRemoteState(state)
+          .then(() => setSyncStatus("saved @ " + new Date().toLocaleTimeString()))
+          .catch(err => {
+            console.warn("Remote save failed:", err?.message || err);
+            setSyncStatus("save failed: " + (err?.message || err));
+          });
+      }, 400); // debounce rapid edits
+
+      return () => clearTimeout(t);
+    }, [kids, routines, demerits, rewards, txns, subs, parentPIN, booted]);
+
+    // Helpers
+    const addTxn = (kidId, delta, reason, parent = "Parent") => {
+      const t = { id: rid(), ts: new Date().toISOString(), kidId, delta, reason, parent };
+      setTxns(prev => [t, ...prev]);
+      setKids(prev => prev.map(k => (k.id === kidId ? { ...k, points: Math.max(0, k.points + delta) } : k)));
+    };
+
+    const submitRoutine = (kidId, routineId, note = "") => {
+      const routine = routineMap[routineId];
+      if (!routine) return;
+      const todayKey = new Date().toDateString();
+      const dup = subs.find(s => s.kidId === kidId && s.routineId === routineId && new Date(s.ts).toDateString() === todayKey && s.status !== 'rejected');
+      if (dup) { alert("Already submitted for today."); return; }
+      const s = { id: rid(), ts: new Date().toISOString(), kidId, routineId, status: "pending", note };
+      setSubs(prev => [s, ...prev]);
+    };
+
+    const approveSubmission = (subId) => {
+      const existing = subs.find(x => x.id === subId);
+      if (!existing) return;
+      const r = routineMap[existing.routineId];
+      if (!r) return;
+      setSubs(prev => prev.map(s => (s.id === subId ? { ...s, status: "approved" } : s)));
+      addTxn(existing.kidId, r.points, `Approved: ${r.name}`);
+    };
+
+    const rejectSubmission = (subId) => {
+      setSubs(prev => prev.map(s => (s.id === subId ? { ...s, status: "rejected" } : s)));
+    };
+
+    const applyDemerit = (kidId, demeritId) => {
+      const d = demeritMap[demeritId];
+      if (!d) return;
+      addTxn(kidId, d.points, `Demerit: ${d.name}`);
+    };
+
+    const resetWeek = () => {
+      if (!window.confirm("Start a new week? This keeps history but sets balances to 0.")) return;
+      setKids(prev => prev.map(k => ({ ...k, points: 0 })));
+      setTxns(prev => [{ id: rid(), ts: new Date().toISOString(), kidId: null, delta: 0, reason: "Weekly reset", parent: "System" }, ...prev]);
+    };
+
+    const startOfWeek = () => {
+      const d = new Date();
+      const day = d.getDay(); // 0 Sun
+      const diff = d.getDate() - day; // Sunday start
+      const s = new Date(d.setDate(diff));
+      s.setHours(0,0,0,0);
+      return s;
+    };
+
+    const weeklyKidCounts = useMemo(() => {
+      const start = startOfWeek();
+      const counts = Object.fromEntries(kids.map(k => [k.id, 0]));
+      txns.forEach(t => {
+        if (!t.kidId || t.delta <= 0) return;
+        const d = new Date(t.ts);
+        if (d >= start) counts[t.kidId] = (counts[t.kidId] || 0) + t.delta;
+      });
+      return counts;
+    }, [txns, kids]);
+
+    const pendingSubs = subs.filter(s => s.status === 'pending');
+
+    // UI
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900">
+        <header className="sticky top-0 z-30 backdrop-blur bg-white/70 border-b border-slate-200">
+          <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="text-2xl">🏆</span>
+              <h1 className="text-xl font-semibold">Family Points</h1>
             </div>
-
-            <div className="space-y-4">
-              {isParentMode ? (
-                <ApprovalQueue pending={pendingSubs} kidMap={kidMap} routineMap={routineMap} onApprove={approveSubmission} onReject={rejectSubmission} />
-              ) : (
-                <TipsCard />
+            <div className="flex items-center gap-3">
+              <span className="text-[11px] text-slate-500 hidden sm:inline">Sync: {syncStatus}</span>
+              {isParentMode && (
+                <span className="text-xs px-2 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200">{pendingSubs.length} pending</span>
               )}
-
-              <ApplyFromCatalog
-                isParentMode={isParentMode}
-                kids={kids}
-                routines={routines}
-                demerits={demerits}
-                onGrant={(kidId, routineId) => { const r = routineMap[routineId]; if(!r) return; addTxn(kidId, r.points, `Completed: ${r.name}`); }}
-                onDemerit={(kidId, demeritId) => applyDemerit(kidId, demeritId)}
-              />
-
-              <QuickAdjustCard kids={kids} onDelta={(kidId, delta, reason) => addTxn(kidId, delta, reason)} />
+              <button
+                className={`px-3 py-1.5 rounded-xl text-sm border ${isParentMode ? "bg-emerald-600 text-white" : "bg-white"}`}
+                onClick={() => toggleParent({ isParentMode, setIsParentMode, parentPIN })}
+              >{isParentMode ? "Parent Mode" : "Kid View"}</button>
             </div>
-          </section>
-        )}
+          </div>
+        </header>
 
-        {activeTab === "transactions" && (
-          <section className="space-y-4">
-            <div className="flex items-center gap-2">
-              <label className="text-sm">Filter:</label>
-              <select className="px-2 py-1.5 border rounded-xl text-sm" value={filterKid} onChange={e => setFilterKid(e.target.value)}>
-                <option value="all">All kids</option>
-                {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-              </select>
-            </div>
-            <TxnTable txns={txns.filter(t => (filterKid === 'all' ? true : t.kidId === filterKid))} kidMap={kidMap} />
-          </section>
-        )}
+        <main className="max-w-6xl mx-auto px-4 py-6">
+          <nav className="flex gap-2 mb-6">
+            {[
+              { id: "dashboard", label: "Dashboard" },
+              { id: "routines", label: "Routines" },
+              { id: "transactions", label: "History" },
+              { id: "manage", label: "Manage" },
+              { id: "settings", label: "Settings" },
+            ].map(t => (
+              <button key={t.id} onClick={() => setActiveTab(t.id)} className={`px-3 py-1.5 rounded-xl text-sm border ${activeTab === t.id ? "bg-slate-900 text-white" : "bg-white"}`}>{t.label}</button>
+            ))}
+          </nav>
 
-        {activeTab === "manage" && (
-          <ManagePanel
-            isParentMode={isParentMode}
-            kids={kids}
-            setKids={setKids}
-            routines={routines}
-            setRoutines={setRoutines}
-            demerits={demerits}
-            setDemerits={setDemerits}
-            rewards={rewards}
-            setRewards={setRewards}
-          />
-        )}
+          {activeTab === "dashboard" && (
+            <section className="grid md:grid-cols-3 gap-4">
+              {kids.map(k => (
+                <KidCard
+                  key={k.id}
+                  kid={k}
+                  rewards={rewards}
+                  onRedeem={(reward) => handleRedeem({ kid: k, reward, addTxn, isParentMode })}
+                  isParentMode={isParentMode}
+                  setPoints={(id, pts) => setKids(prev => prev.map(x => x.id===id?{...x, points: Math.max(0, pts)}:x))}
+                  weeklyPoints={weeklyKidCounts[k.id] || 0}
+                />
+              ))}
+              <Leaderboard kids={kids} />
+            </section>
+          )}
 
-        {activeTab === "settings" && (
-          <SettingsPanel isParentMode={isParentMode} parentPIN={parentPIN} setParentPIN={setParentPIN} resetWeek={resetWeek} />
-        )}
-      </main>
-
-      <footer className="max-w-6xl mx-auto px-4 py-10 text-center text-xs text-slate-500">
-        Built for Abheek’s family • Data stored locally • Redemption requires Parent Mode
-      </footer>
-    </div>
-  );
-}
-
-// ---------------- Components -----------------
-function KidPicker({ kids, value, onChange }) {
-  return (
-    <select className="px-2 py-1.5 border rounded-xl text-sm" value={value} onChange={e => onChange(e.target.value)}>
-      {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-    </select>
-  );
-}
-
-function TipsCard() {
-  return (
-    <div className="p-4 bg-white border rounded-2xl shadow-sm text-sm text-slate-600">
-      Kid tip: Tap a routine to submit it. A parent will approve it to add points. You can see totals on the Dashboard.
-    </div>
-  );
-}
-
-function RoutineList({ routines, onSubmit }) {
-  const groups = useMemo(() => ({
-    Daily: routines.filter(r => r.freq === 'Daily'),
-    Weekly: routines.filter(r => r.freq === 'Weekly'),
-    'Ad‑hoc': routines.filter(r => r.freq === 'Ad-hoc'),
-  }), [routines]);
-
-  const Section = ({ title, items }) => (
-    <div className="mb-4">
-      <h4 className="font-semibold mb-2">{title}</h4>
-      {items.length === 0 ? (
-        <div className="text-sm text-slate-500">No routines.</div>
-      ) : (
-        <div className="grid sm:grid-cols-2 gap-2">
-          {items.map(r => (
-            <button key={r.id} onClick={() => onSubmit(r.id)} className="flex items-center justify-between px-3 py-2 border rounded-xl text-sm bg-white hover:bg-slate-50">
-              <span>{r.name}</span>
-              <span className="font-medium">+{r.points}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    <div>
-      <Section title="Daily" items={groups.Daily} />
-      <Section title="Weekly" items={groups.Weekly} />
-      <Section title="Ad‑hoc" items={groups['Ad‑hoc']} />
-    </div>
-  );
-}
-
-function ApprovalQueue({ pending, kidMap, routineMap, onApprove, onReject }) {
-  return (
-    <div className="p-4 bg-white border rounded-2xl shadow-sm">
-      <h3 className="font-semibold mb-3">Approval Queue</h3>
-      {pending.length === 0 ? (
-        <div className="text-sm text-slate-500">No pending submissions.</div>
-      ) : (
-        <ul className="space-y-2">
-          {pending.map(s => (
-            <li key={s.id} className="flex items-center justify-between gap-3 p-3 border rounded-xl bg-white">
-              <div className="text-sm">
-                <div><strong>{kidMap[s.kidId]?.name}</strong> → {routineMap[s.routineId]?.name}</div>
-                <div className="text-slate-500 text-xs">{new Date(s.ts).toLocaleString()}</div>
+          {activeTab === "routines" && (
+            <section className="grid md:grid-cols-3 gap-6 items-start">
+              <div className="md:col-span-2 bg-white border rounded-2xl shadow-sm p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="text-sm">I am</span>
+                  <KidPicker kids={kids} value={activeKidId} onChange={setActiveKidId} />
+                </div>
+                <RoutineList routines={routines} onSubmit={(routineId) => submitRoutine(activeKidId, routineId)} />
               </div>
+
+              <div className="space-y-4">
+                {isParentMode ? (
+                  <ApprovalQueue pending={pendingSubs} kidMap={kidMap} routineMap={routineMap} onApprove={approveSubmission} onReject={rejectSubmission} />
+                ) : (
+                  <TipsCard />
+                )}
+
+                <ApplyFromCatalog
+                  isParentMode={isParentMode}
+                  kids={kids}
+                  routines={routines}
+                  demerits={demerits}
+                  onGrant={(kidId, routineId) => { const r = routineMap[routineId]; if(!r) return; addTxn(kidId, r.points, `Completed: ${r.name}`); }}
+                  onDemerit={(kidId, demeritId) => applyDemerit(kidId, demeritId)}
+                />
+
+                <QuickAdjustCard kids={kids} onDelta={(kidId, delta, reason) => addTxn(kidId, delta, reason)} />
+              </div>
+            </section>
+          )}
+
+          {activeTab === "transactions" && (
+            <section className="space-y-4">
               <div className="flex items-center gap-2">
-                <button onClick={() => onApprove(s.id)} className="px-3 py-1.5 rounded-xl text-sm bg-emerald-600 text-white">Approve</button>
-                <button onClick={() => onReject(s.id)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">Reject</button>
+                <label className="text-sm">Filter:</label>
+                <select className="px-2 py-1.5 border rounded-xl text-sm" value={filterKid} onChange={e => setFilterKid(e.target.value)}>
+                  <option value="all">All kids</option>
+                  {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
+                </select>
               </div>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
+              <TxnTable txns={txns.filter(t => (filterKid === 'all' ? true : t.kidId === filterKid))} kidMap={kidMap} />
+            </section>
+          )}
 
-function ApplyFromCatalog({ isParentMode, kids, routines, demerits, onGrant, onDemerit }) {
-  const [kidId, setKidId] = useState(kids[0]?.id || "");
-  const [routineId, setRoutineId] = useState(routines[0]?.id || "");
-  const [demeritId, setDemeritId] = useState(demerits[0]?.id || "");
- 
-  if (!isParentMode) return <Gate />;
+          {activeTab === "manage" && (
+            <ManagePanel
+              isParentMode={isParentMode}
+              kids={kids}
+              setKids={setKids}
+              routines={routines}
+              setRoutines={setRoutines}
+              demerits={demerits}
+              setDemerits={setDemerits}
+              rewards={rewards}
+              setRewards={setRewards}
+            />
+          )}
 
-  return (
-    <div className="p-4 bg-white border rounded-2xl shadow-sm">
-      <h3 className="font-semibold mb-3">Apply from Catalog</h3>
-      <div className="grid grid-cols-1 gap-3">
-        <div className="grid grid-cols-2 gap-2">
-          <select className="px-2 py-1.5 border rounded-xl text-sm" value={kidId} onChange={e => setKidId(e.target.value)}>
+          {activeTab === "settings" && (
+            <SettingsPanel isParentMode={isParentMode} parentPIN={parentPIN} setParentPIN={setParentPIN} resetWeek={resetWeek} />
+          )}
+        </main>
+
+        <footer className="max-w-6xl mx-auto px-4 py-10 text-center text-xs text-slate-500">
+          Built for Abheek’s family • Data synced via Google Sheets • Redemption requires Parent Mode
+        </footer>
+      </div>
+    );
+  }
+
+  // ---------------- Components -----------------
+  function KidPicker({ kids, value, onChange }) {
+    return (
+      <select className="px-2 py-1.5 border rounded-xl text-sm" value={value} onChange={e => onChange(e.target.value)}>
+        {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
+      </select>
+    );
+  }
+
+  function TipsCard() {
+    return (
+      <div className="p-4 bg-white border rounded-2xl shadow-sm text-sm text-slate-600">
+        Kid tip: Tap a routine to submit it. A parent will approve it to add points. You can see totals on the Dashboard.
+      </div>
+    );
+  }
+
+  function RoutineList({ routines, onSubmit }) {
+    const groups = useMemo(() => ({
+      Daily: routines.filter(r => r.freq === 'Daily'),
+      Weekly: routines.filter(r => r.freq === 'Weekly'),
+      'Ad-hoc': routines.filter(r => r.freq === 'Ad-hoc'),
+    }), [routines]);
+
+    const Section = ({ title, items }) => (
+      <div className="mb-4">
+        <h4 className="font-semibold mb-2">{title}</h4>
+        {items.length === 0 ? (
+          <div className="text-sm text-slate-500">No routines.</div>
+        ) : (
+          <div className="grid sm:grid-cols-2 gap-2">
+            {items.map(r => (
+              <button key={r.id} onClick={() => onSubmit(r.id)} className="flex items-center justify-between px-3 py-2 border rounded-xl text-sm bg-white hover:bg-slate-50">
+                <span>{r.name}</span>
+                <span className="font-medium">+{r.points}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+
+    return (
+      <div>
+        <Section title="Daily" items={groups.Daily} />
+        <Section title="Weekly" items={groups.Weekly} />
+        <Section title="Ad-hoc" items={groups['Ad-hoc']} />
+      </div>
+    );
+  }
+
+  function ApprovalQueue({ pending, kidMap, routineMap, onApprove, onReject }) {
+    return (
+      <div className="p-4 bg-white border rounded-2xl shadow-sm">
+        <h3 className="font-semibold mb-3">Approval Queue</h3>
+        {pending.length === 0 ? (
+          <div className="text-sm text-slate-500">No pending submissions.</div>
+        ) : (
+          <ul className="space-y-2">
+            {pending.map(s => (
+              <li key={s.id} className="flex items-center justify-between gap-3 p-3 border rounded-xl bg-white">
+                <div className="text-sm">
+                  <div><strong>{kidMap[s.kidId]?.name}</strong> → {routineMap[s.routineId]?.name}</div>
+                  <div className="text-slate-500 text-xs">{new Date(s.ts).toLocaleString()}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => onApprove(s.id)} className="px-3 py-1.5 rounded-xl text-sm bg-emerald-600 text-white">Approve</button>
+                  <button onClick={() => onReject(s.id)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">Reject</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
+  function ApplyFromCatalog({ isParentMode, kids, routines, demerits, onGrant, onDemerit }) {
+    const [kidId, setKidId] = useState(kids[0]?.id || "");
+    const [routineId, setRoutineId] = useState(routines[0]?.id || "");
+    const [demeritId, setDemeritId] = useState(demerits[0]?.id || "");
+    if (!isParentMode) return <Gate />;
+
+    return (
+      <div className="p-4 bg-white border rounded-2xl shadow-sm">
+        <h3 className="font-semibold mb-3">Apply from Catalog</h3>
+        <div className="grid grid-cols-1 gap-3">
+          <div className="grid grid-cols-2 gap-2">
+            <select className="px-2 py-1.5 border rounded-xl text-sm" value={kidId} onChange={e => setKidId(e.target.value)}>
+              {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
+            </select>
+            <select className="px-2 py-1.5 border rounded-xl text-sm" value={routineId} onChange={e => setRoutineId(e.target.value)}>
+              {routines.map(r => <option key={r.id} value={r.id}>{r.name} (+{r.points})</option>)}
+            </select>
+          </div>
+          <button onClick={() => kidId && routineId && onGrant(kidId, routineId)} className="px-3 py-1.5 rounded-xl text-sm bg-emerald-600 text-white">Grant Routine Points</button>
+          <div className="grid grid-cols-2 gap-2">
+            <select className="px-2 py-1.5 border rounded-XL text-sm" value={demeritId} onChange={e => setDemeritId(e.target.value)}>
+              {demerits.map(d => <option key={d.id} value={d.id}>{d.name} ({d.points})</option>)}
+            </select>
+            <button onClick={() => kidId && demeritId && onDemerit(kidId, demeritId)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">Apply Demerit</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function QuickAdjustCard({ kids, onDelta }) {
+    const [kidId, setKidId] = useState(kids[0]?.id || "");
+    const [delta, setDelta] = useState(1);
+    const [reason, setReason] = useState("Great job");
+
+    return (
+      <div className="p-4 bg-white border rounded-2xl shadow-sm">
+        <h3 className="font-semibold mb-3">Quick Award / Demerit</h3>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <select className="px-2 py-1.5 border rounded-XL text-sm" value={kidId} onChange={e => setKidId(e.target.value)}>
             {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
           </select>
-          <select className="px-2 py-1.5 border rounded-xl text-sm" value={routineId} onChange={e => setRoutineId(e.target.value)}>
-            {routines.map(r => <option key={r.id} value={r.id}>{r.name} (+{r.points})</option>)}
-          </select>
+          <input type="number" className="px-2 py-1.5 border rounded-XL text-sm" value={delta} onChange={e => setDelta(Number(e.target.value || 0))} />
         </div>
-        <button onClick={() => kidId && routineId && onGrant(kidId, routineId)} className="px-3 py-1.5 rounded-xl text-sm bg-emerald-600 text-white">Grant Routine Points</button>
-        <div className="grid grid-cols-2 gap-2">
-          <select className="px-2 py-1.5 border rounded-xl text-sm" value={demeritId} onChange={e => setDemeritId(e.target.value)}>
-            {demerits.map(d => <option key={d.id} value={d.id}>{d.name} ({d.points})</option>)}
-          </select>
-          <button onClick={() => kidId && demeritId && onDemerit(kidId, demeritId)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">Apply Demerit</button>
+        <input type="text" className="w-full px-2 py-1.5 border rounded-XL text-sm mb-2" value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason (e.g., Helped with dishes)" />
+        <div className="flex flex-wrap gap-2 mb-2">
+          {[1,2,3,5].map(v => <button key={v} onClick={() => setDelta(v)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">+{v}</button>)}
+          {[-1,-2,-3,-5].map(v => <button key={v} onClick={() => setDelta(v)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">{v}</button>)}
         </div>
+        <button onClick={() => kidId && onDelta(kidId, delta, reason)} className="px-3 py-1.5 rounded-xl text-sm bg-slate-900 text-white">Apply</button>
       </div>
-    </div>
-  );
-}
+    );
+  }
 
-function QuickAdjustCard({ kids, onDelta }) {
-  const [kidId, setKidId] = useState(kids[0]?.id || "");
-  const [delta, setDelta] = useState(1);
-  const [reason, setReason] = useState("Great job");
+  function KidCard({ kid, rewards, onRedeem, isParentMode, setPoints, weeklyPoints }) {
+    const cheapest = rewards.length ? Math.min(...rewards.map(r => r.cost)) : 0;
+    const percent = cheapest ? Math.min(100, Math.round((kid.points / cheapest) * 100)) : 0;
+    return (
+      <div className="bg-white border rounded-2xl shadow-sm p-4 flex flex-col">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-semibold text-lg">{kid.name}</h3>
+          <span className="text-sm px-2 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200">{kid.points} pts</span>
+        </div>
+        <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden mb-2">
+          <div className="h-2" style={{ width: `${percent}%`, background: "linear-gradient(90deg, rgba(16,185,129,1) 0%, rgba(52,211,153,1) 100%)" }} />
+        </div>
+        <div className="text-xs text-slate-600 mb-3">This week earned: <strong>{weeklyPoints}</strong> pts</div>
 
-  return (
-    <div className="p-4 bg-white border rounded-2xl shadow-sm">
-      <h3 className="font-semibold mb-3">Quick Award / Demerit</h3>
-      <div className="grid grid-cols-2 gap-2 mb-2">
-        <select className="px-2 py-1.5 border rounded-xl text-sm" value={kidId} onChange={e => setKidId(e.target.value)}>
-          {kids.map(k => <option key={k.id} value={k.id}>{k.name}</option>)}
-        </select>
-        <input type="number" className="px-2 py-1.5 border rounded-xl text-sm" value={delta} onChange={e => setDelta(Number(e.target.value || 0))} />
-      </div>
-      <input type="text" className="w-full px-2 py-1.5 border rounded-xl text-sm mb-2" value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason (e.g., Helped with dishes)" />
-      <div className="flex flex-wrap gap-2 mb-2">
-        {[1,2,3,5].map(v => <button key={v} onClick={() => setDelta(v)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">+{v}</button>)}
-        {[-1,-2,-3,-5].map(v => <button key={v} onClick={() => setDelta(v)} className="px-3 py-1.5 rounded-xl text-sm border bg-white">{v}</button>)}
-      </div>
-      <button onClick={() => kidId && onDelta(kidId, delta, reason)} className="px-3 py-1.5 rounded-xl text-sm bg-slate-900 text-white">Apply</button>
-    </div>
-  );
-}
+        <div className="mt-auto">
+          <h4 className="font-medium mb-2">Reward Store</h4>
+          <div className="grid grid-cols-1 gap-2">
+            {rewards.map(r => (
+              <button
+                key={r.id}
+                disabled={!isParentMode || kid.points < r.cost}
+                title={!isParentMode ? "Parent Mode required" : (kid.points < r.cost ? "Not enough points" : "")}
+                onClick={() => onRedeem(r)}
+                className="flex items-center justify-between w-full px-3 py-2 border rounded-xl text-sm disabled:opacity-50"
+              >
+                <span>{r.name}</span>
+                <span className="font-medium">{r.cost} pts</span>
+              </button>
+            ))}
+          </div>
+          {!isParentMode && <div className="text-[11px] text-slate-500 mt-2">Parent Mode required to redeem.</div>}
+        </div>
 
-function KidCard({ kid, rewards, onRedeem, isParentMode, setPoints, weeklyPoints }) {
-  const cheapest = rewards.length ? Math.min(...rewards.map(r => r.cost)) : 0;
-  const percent = cheapest ? Math.min(100, Math.round((kid.points / cheapest) * 100)) : 0;
-  return (
-    <div className="bg-white border rounded-2xl shadow-sm p-4 flex flex-col">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="font-semibold text-lg">{kid.name}</h3>
-        <span className="text-sm px-2 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200">{kid.points} pts</span>
+        {isParentMode && (
+          <div className="mt-4 flex items-center gap-2">
+            <input type="number" className="px-2 py-1.5 border rounded-xl text-sm w-24" defaultValue={kid.points} onBlur={e => setPoints(kid.id, Number(e.target.value || 0))} />
+            <span className="text-xs text-slate-500">Set points</span>
+          </div>
+        )}
       </div>
-      <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden mb-2">
-        <div className="h-2" style={{ width: `${percent}%`, background: "linear-gradient(90deg, rgba(16,185,129,1) 0%, rgba(52,211,153,1) 100%)" }} />
-      </div>
-      <div className="text-xs text-slate-600 mb-3">This week earned: <strong>{weeklyPoints}</strong> pts</div>
+    );
+  }
 
-      <div className="mt-auto">
-        <h4 className="font-medium mb-2">Reward Store</h4>
-        <div className="grid grid-cols-1 gap-2">
-          {rewards.map(r => (
-            <button
-              key={r.id}
-              disabled={!isParentMode || kid.points < r.cost}
-              title={!isParentMode ? "Parent Mode required" : (kid.points < r.cost ? "Not enough points" : "")}
-              onClick={() => onRedeem(r)}
-              className="flex items-center justify-between w-full px-3 py-2 border rounded-xl text-sm disabled:opacity-50"
-            >
-              <span>{r.name}</span>
-              <span className="font-medium">{r.cost} pts</span>
-            </button>
+  function Leaderboard({ kids }) {
+    const sorted = [...kids].sort((a, b) => b.points - a.points);
+    return (
+      <div className="bg-white border rounded-2xl shadow-sm p-4">
+        <h3 className="font-semibold mb-3">Leaderboard</h3>
+        <ol className="space-y-2">
+          {sorted.map((k, i) => (
+            <li key={k.id} className="flex items-center justify-between">
+              <div className="flex items-center gap-2"><span className="w-5 text-right text-slate-500">{i+1}.</span><span>{k.name}</span></div>
+              <span className="font-medium">{k.points} pts</span>
+            </li>
           ))}
-        </div>
-        {!isParentMode && <div className="text-[11px] text-slate-500 mt-2">Parent Mode required to redeem.</div>}
+        </ol>
       </div>
+    );
+  }
 
-      {isParentMode && (
-        <div className="mt-4 flex items-center gap-2">
-          <input type="number" className="px-2 py-1.5 border rounded-xl text-sm w-24" defaultValue={kid.points} onBlur={e => setPoints(kid.id, Number(e.target.value || 0))} />
-          <span className="text-xs text-slate-500">Set points</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Leaderboard({ kids }) {
-  const sorted = [...kids].sort((a, b) => b.points - a.points);
-  return (
-    <div className="bg-white border rounded-2xl shadow-sm p-4">
-      <h3 className="font-semibold mb-3">Leaderboard</h3>
-      <ol className="space-y-2">
-        {sorted.map((k, i) => (
-          <li key={k.id} className="flex items-center justify-between">
-            <div className="flex items-center gap-2"><span className="w-5 text-right text-slate-500">{i+1}.</span><span>{k.name}</span></div>
-            <span className="font-medium">{k.points} pts</span>
-          </li>
-        ))}
-      </ol>
-    </div>
-  );
-}
-
-function TxnTable({ txns, kidMap }) {
-  if (txns.length === 0) return <div className="p-4 bg-white border rounded-2xl text-sm text-slate-500">No history yet.</div>;
-  return (
-    <div className="overflow-x-auto bg-white border rounded-2xl">
-      <table className="min-w-full text-sm">
-        <thead className="bg-slate-100">
-          <tr>
-            <th className="text-left px-3 py-2">When</th>
-            <th className="text-left px-3 py-2">Kid</th>
-            <th className="text-left px-3 py-2">Change</th>
-            <th className="text-left px-3 py-2">Reason</th>
-            <th className="text-left px-3 py-2">By</th>
-          </tr>
-        </thead>
-        <tbody>
-          {txns.map(t => (
-            <tr key={t.id} className="border-t">
-              <td className="px-3 py-2 text-slate-600">{new Date(t.ts).toLocaleString()}</td>
-              <td className="px-3 py-2">{t.kidId ? kidMap[t.kidId]?.name : "—"}</td>
-              <td className={`px-3 py-2 font-medium ${t.delta>0?"text-emerald-700":t.delta<0?"text-rose-700":"text-slate-700"}`}>{t.delta>0?`+${t.delta}`:t.delta}</td>
-              <td className="px-3 py-2">{t.reason}</td>
-              <td className="px-3 py-2">{t.parent}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ManagePanel({ isParentMode, kids, setKids, routines, setRoutines, demerits, setDemerits, rewards, setRewards }) {
-  if (!isParentMode) return <Gate />;
-  return (
-    <div className="grid md:grid-cols-2 gap-6">
-      <Card title="Kids">
-        <SimpleList items={kids} columns={[{key:'name',label:'Name'},{key:'points',label:'Points',type:'number'}]} onAdd={(name)=>setKids(p=>[...p,{id:rid(),name,points:0}])} onUpdate={(id,updates)=>setKids(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setKids(p=>p.filter(i=>i.id!==id))} />
-      </Card>
-      <Card title="Routines (Positive)">
-        <SimpleList items={routines} columns={[{key:'name',label:'Routine'},{key:'points',label:'Points',type:'number'},{key:'freq',label:'Frequency'}]} onAdd={(name)=>setRoutines(p=>[...p,{id:rid(),name,points:1,freq:'Daily'}])} onUpdate={(id,updates)=>setRoutines(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setRoutines(p=>p.filter(i=>i.id!==id))} />
-      </Card>
-      <Card title="Demerits (Negative)">
-        <SimpleList items={demerits} columns={[{key:'name',label:'Demerit'},{key:'points',label:'Points (neg)',type:'number'}]} onAdd={(name)=>setDemerits(p=>[...p,{id:rid(),name,points:-1}])} onUpdate={(id,updates)=>setDemerits(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setDemerits(p=>p.filter(i=>i.id!==id))} />
-      </Card>
-      <Card title="Rewards (Store)">
-        <SimpleList items={rewards} columns={[{key:'name',label:'Reward'},{key:'cost',label:'Cost',type:'number'}]} onAdd={(name)=>setRewards(p=>[...p,{id:rid(),name,cost:10}])} onUpdate={(id,updates)=>setRewards(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setRewards(p=>p.filter(i=>i.id!==id))} />
-      </Card>
-    </div>
-  );
-}
-
-function SettingsPanel({ isParentMode, parentPIN, setParentPIN, resetWeek }) {
-  if (!isParentMode) return <Gate />;
-  return (
-    <div className="grid md:grid-cols-2 gap-6">
-      <Card title="Weekly Cycle">
-        <p className="text-sm text-slate-600 mb-3">Use this to start fresh every week.</p>
-        <button onClick={resetWeek} className="px-3 py-1.5 rounded-xl text-sm bg-rose-600 text-white">Reset Week</button>
-      </Card>
-      <Card title="Parent PIN">
-        <p className="text-sm text-slate-600 mb-3">Protect management, approvals, and redemption.</p>
-        <div className="flex items-center gap-2">
-          <input type="password" className="px-2 py-1.5 border rounded-xl text-sm w-36" value={parentPIN} onChange={e=>setParentPIN(e.target.value)} />
-          <span className="text-xs text-slate-500">Default 1234</span>
-        </div>
-      </Card>
-      <Card title="Tips">
-        <ul className="list-disc pl-5 text-sm text-slate-600 space-y-1">
-          <li>Keep it positive: demerits should be small (e.g., -1 or -2) and rare.</li>
-          <li>Let kids help choose routines and rewards to boost buy-in.</li>
-          <li>Consider a weekly "cash-out" night where redemptions happen together.</li>
-        </ul>
-      </Card>
-    </div>
-  );
-}
-
-function SimpleList({ items, columns, onAdd, onUpdate, onDelete }) {
-  const [newName, setNewName] = useState("");
-  return (
-    <div className="space-y-3">
-      <div className="overflow-x-auto border rounded-2xl">
+  function TxnTable({ txns, kidMap }) {
+    if (txns.length === 0) return <div className="p-4 bg-white border rounded-2xl text-sm text-slate-500">No history yet.</div>;
+    return (
+      <div className="overflow-x-auto bg-white border rounded-2xl">
         <table className="min-w-full text-sm">
           <thead className="bg-slate-100">
             <tr>
-              {columns.map(c => <th key={c.key} className="text-left px-3 py-2">{c.label}</th>)}
-              <th className="px-3 py-2"></th>
+              <th className="text-left px-3 py-2">When</th>
+              <th className="text-left px-3 py-2">Kid</th>
+              <th className="text-left px-3 py-2">Change</th>
+              <th className="text-left px-3 py-2">Reason</th>
+              <th className="text-left px-3 py-2">By</th>
             </tr>
           </thead>
           <tbody>
-            {items.map(item => (
-              <tr key={item.id} className="border-t">
-                {columns.map(c => (
-                  <td key={c.key} className="px-3 py-2">
-                    {c.type === 'number' ? (
-                      <input type="number" className="px-2 py-1.5 border rounded-xl text-sm w-28" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:Number(e.target.value||0)})} />
-                    ) : c.key === 'freq' ? (
-                      <select className="px-2 py-1.5 border rounded-xl text-sm" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:e.target.value})}>
-                        <option>Daily</option>
-                        <option>Weekly</option>
-                        <option>Ad-hoc</option>
-                      </select>
-                    ) : (
-                      <input type="text" className="px-2 py-1.5 border rounded-xl text-sm w-full" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:e.target.value})} />
-                    )}
-                  </td>
-                ))}
-                <td className="px-3 py-2 text-right"><button onClick={()=>onDelete(item.id)} className="px-2 py-1 text-xs rounded-lg border bg-white">Delete</button></td>
+            {txns.map(t => (
+              <tr key={t.id} className="border-t">
+                <td className="px-3 py-2 text-slate-600">{new Date(t.ts).toLocaleString()}</td>
+                <td className="px-3 py-2">{t.kidId ? kidMap[t.kidId]?.name : "—"}</td>
+                <td className={`px-3 py-2 font-medium ${t.delta>0?"text-emerald-700":t.delta<0?"text-rose-700":"text-slate-700"}`}>{t.delta>0?`+${t.delta}`:t.delta}</td>
+                <td className="px-3 py-2">{t.reason}</td>
+                <td className="px-3 py-2">{t.parent}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      <div className="flex gap-2">
-        <input className="px-2 py-1.5 border rounded-xl text-sm flex-1" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Add new…" />
-        <button onClick={()=>{if(!newName.trim())return; onAdd(newName.trim()); setNewName("");}} className="px-3 py-1.5 rounded-xl text-sm bg-slate-900 text-white">Add</button>
-      </div>
-    </div>
-  );
-}
-
-function Card({ title, children }) {
-  return (
-    <div className="bg-white border rounded-2xl shadow-sm p-4">
-      <h3 className="font-semibold mb-3">{title}</h3>
-      {children}
-    </div>
-  );
-}
-
-function Gate(){
-  return <div className="p-4 bg-white border rounded-2xl text-sm text-slate-600">Parent Mode required. Tap the header button and enter your PIN.</div>;
-}
-
-function handleRedeem({ kid, reward, addTxn, isParentMode }){
-  if (!isParentMode) { alert("Parent Mode required to redeem."); return; }
-  if (kid.points < reward.cost) return;
-  if (!window.confirm(`Redeem "${reward.name}" for ${reward.cost} points from ${kid.name}?`)) return;
-  addTxn(kid.id, -reward.cost, `Redeemed: ${reward.name}`);
-}
-
-function toggleParent({ isParentMode, setIsParentMode, parentPIN }){
-  if (isParentMode) { setIsParentMode(false); return; }
-  const input = window.prompt("Enter Parent PIN (default 1234)");
-  if (input === parentPIN) setIsParentMode(true); else if (input !== null) alert("Incorrect PIN");
-}
-
-function rid(){
-  if (window.crypto && window.crypto.getRandomValues) {
-    const b = new Uint8Array(6);
-    window.crypto.getRandomValues(b);
-    return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    );
   }
-  let out = '';
-  for (let i = 0; i < 6; i++) out += Math.floor(Math.random()*256).toString(16).padStart(2,'0');
-  return out;
-}
 
-</script>
+  function ManagePanel({ isParentMode, kids, setKids, routines, setRoutines, demerits, setDemerits, rewards, setRewards }) {
+    if (!isParentMode) return <Gate />;
+    return (
+      <div className="grid md:grid-cols-2 gap-6">
+        <Card title="Kids">
+          <SimpleList items={kids} columns={[{key:'name',label:'Name'},{key:'points',label:'Points',type:'number'}]} onAdd={(name)=>setKids(p=>[...p,{id:rid(),name,points:0}])} onUpdate={(id,updates)=>setKids(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setKids(p=>p.filter(i=>i.id!==id))} />
+        </Card>
+        <Card title="Routines (Positive)">
+          <SimpleList items={routines} columns={[{key:'name',label:'Routine'},{key:'points',label:'Points',type:'number'},{key:'freq',label:'Frequency'}]} onAdd={(name)=>setRoutines(p=>[...p,{id:rid(),name,points:1,freq:'Daily'}])} onUpdate={(id,updates)=>setRoutines(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setRoutines(p=>p.filter(i=>i.id!==id))} />
+        </Card>
+        <Card title="Demerits (Negative)">
+          <SimpleList items={demerits} columns={[{key:'name',label:'Demerit'},{key:'points',label:'Points (neg)',type:'number'}]} onAdd={(name)=>setDemerits(p=>[...p,{id:rid(),name,points:-1}])} onUpdate={(id,updates)=>setDemerits(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setDemerits(p=>p.filter(i=>i.id!==id))} />
+        </Card>
+        <Card title="Rewards (Store)">
+          <SimpleList items={rewards} columns={[{key:'name',label:'Reward'},{key:'cost',label:'Cost',type:'number'}]} onAdd={(name)=>setRewards(p=>[...p,{id:rid(),name,cost:10}])} onUpdate={(id,updates)=>setRewards(p=>p.map(i=>i.id===id?{...i,...updates}:i))} onDelete={(id)=>setRewards(p=>p.filter(i=>i.id!==id))} />
+        </Card>
+      </div>
+    );
+  }
+
+  function SettingsPanel({ isParentMode, parentPIN, setParentPIN, resetWeek }) {
+    if (!isParentMode) return <Gate />;
+    return (
+      <div className="grid md:grid-cols-2 gap-6">
+        <Card title="Weekly Cycle">
+          <p className="text-sm text-slate-600 mb-3">Use this to start fresh every week.</p>
+          <button onClick={resetWeek} className="px-3 py-1.5 rounded-xl text-sm bg-rose-600 text-white">Reset Week</button>
+        </Card>
+        <Card title="Parent PIN">
+          <p className="text-sm text-slate-600 mb-3">Protect management, approvals, and redemption.</p>
+          <div className="flex items-center gap-2">
+            <input type="password" className="px-2 py-1.5 border rounded-xl text-sm w-36" value={parentPIN} onChange={e=>setParentPIN(e.target.value)} />
+            <span className="text-xs text-slate-500">Default 1234</span>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  function SimpleList({ items, columns, onAdd, onUpdate, onDelete }) {
+    const [newName, setNewName] = useState("");
+    return (
+      <div className="space-y-3">
+        <div className="overflow-x-auto border rounded-2xl">
+          <table className="min-w-full text-sm">
+            <thead className="bg-slate-100">
+              <tr>
+                {columns.map(c => <th key={c.key} className="text-left px-3 py-2">{c.label}</th>)}
+                <th className="px-3 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map(item => (
+                <tr key={item.id} className="border-t">
+                  {columns.map(c => (
+                    <td key={c.key} className="px-3 py-2">
+                      {c.type === 'number' ? (
+                        <input type="number" className="px-2 py-1.5 border rounded-xl text-sm w-28" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:Number(e.target.value||0)})} />
+                      ) : c.key === 'freq' ? (
+                        <select className="px-2 py-1.5 border rounded-xl text-sm" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:e.target.value})}>
+                          <option>Daily</option>
+                          <option>Weekly</option>
+                          <option>Ad-hoc</option>
+                        </select>
+                      ) : (
+                        <input type="text" className="px-2 py-1.5 border rounded-xl text-sm w-full" value={item[c.key]} onChange={e=>onUpdate(item.id,{[c.key]:e.target.value})} />
+                      )}
+                    </td>
+                  ))}
+                  <td className="px-3 py-2 text-right"><button onClick={()=>onDelete(item.id)} className="px-2 py-1 text-xs rounded-lg border bg-white">Delete</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex gap-2">
+          <input className="px-2 py-1.5 border rounded-xl text-sm flex-1" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Add new…" />
+          <button onClick={()=>{if(!newName.trim())return; onAdd(newName.trim()); setNewName("");}} className="px-3 py-1.5 rounded-xl text-sm bg-slate-900 text-white">Add</button>
+        </div>
+      </div>
+    );
+  }
+
+  function Card({ title, children }) {
+    return (
+      <div className="bg-white border rounded-2xl shadow-sm p-4">
+        <h3 className="font-semibold mb-3">{title}</h3>
+        {children}
+      </div>
+    );
+  }
+
+  function Gate(){
+    return <div className="p-4 bg-white border rounded-2xl text-sm text-slate-600">Parent Mode required. Tap the header button and enter your PIN.</div>;
+  }
+
+  function handleRedeem({ kid, reward, addTxn, isParentMode }){
+    if (!isParentMode) { alert("Parent Mode required to redeem."); return; }
+    if (kid.points < reward.cost) return;
+    if (!window.confirm(`Redeem "${reward.name}" for ${reward.cost} points from ${kid.name}?`)) return;
+    addTxn(kid.id, -reward.cost, `Redeemed: ${reward.name}`);
+  }
+
+  function toggleParent({ isParentMode, setIsParentMode, parentPIN }){
+    if (isParentMode) { setIsParentMode(false); return; }
+    const input = window.prompt("Enter Parent PIN (default 1234)");
+    if (input === parentPIN) setIsParentMode(true); else if (input !== null) alert("Incorrect PIN");
+  }
+
+  function rid(){
+    if (window.crypto && window.crypto.getRandomValues) {
+      const b = new Uint8Array(6);
+      window.crypto.getRandomValues(b);
+      return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    }
+    let out = '';
+    for (let i = 0; i < 6; i++) out += Math.floor(Math.random()*256).toString(16).padStart(2,'0');
+    return out;
+  }
+  </script>
 
   <script type="text/babel">
     // Mount the app
